@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Generic, Sequence, TypeVar
 
@@ -51,7 +51,33 @@ class AuthorizationStatus(str, Enum):
     NOT_FOUND = "not_found"
 
 
+class WorkflowState(str, Enum):
+    RECEIVED = "received"
+    QUARANTINED = "quarantined"
+    NORMALIZED = "normalized"
+    SAFETY_CLASSIFIED = "safety_classified"
+    ROUTED = "routed"
+    WORKSHEET_PENDING = "worksheet_pending"
+    TEXT_VERIFIED = "text_verified"
+    BACKEND_VERIFIED = "backend_verified"
+    RESPONSE_APPROVED = "response_approved"
+    SENT = "sent"
+    SPAM_SUPPRESSED = "spam_suppressed"
+    AWAITING_CUSTOMER_INFO = "awaiting_customer_info"
+    ESCALATED_TO_HUMAN = "escalated_to_human"
+    BACKEND_RETRY_PENDING = "backend_retry_pending"
+    BLOCKED_UNSAFE = "blocked_unsafe"
+
+
 T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class Attachment:
+    filename: str
+    content_type: str
+    content: str = ""
+    size_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -61,6 +87,8 @@ class EvidenceField(Generic[T]):
     source_excerpt: str | None = None
     confidence: float = 0.0
     validator_status: ValidatorStatus = ValidatorStatus.UNVERIFIED
+    disclosure_level: str = "internal"
+    last_verified_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -69,10 +97,12 @@ class RawEmail:
     subject: str
     body_text: str
     html_body: str | None = None
+    raw_mime: str | None = None
     message_id: str = "demo-message"
     thread_id: str = "demo-thread"
     received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     headers: dict[str, str] = field(default_factory=dict)
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -85,6 +115,8 @@ class NormalizedEmail:
     thread_id: str
     received_at: datetime
     headers: dict[str, str]
+    body_hash: str
+    attachment_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -92,6 +124,7 @@ class SafetyAssessment:
     disposition: SafetyDisposition
     labels: set[Intent] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
+    risk_score: float = 0.0
 
 
 @dataclass(slots=True)
@@ -123,6 +156,10 @@ class TrackingLookupResult:
     safe_to_disclose_fields: tuple[str, ...] = ()
     backend_trace_id: str = "backend-demo"
 
+    @property
+    def is_fresh(self) -> bool:
+        return self.data_freshness_seconds is None or self.data_freshness_seconds <= 3600
+
 
 @dataclass(slots=True)
 class TrackingWorksheet:
@@ -147,11 +184,12 @@ class TrackingWorksheet:
         )
 
     def is_ready_for_response(self) -> bool:
-        if self.response_lane in {ResponseLane.NO_REPLY, ResponseLane.BOUNDARY_RESPONSE}:
-            return True
-        if self.response_lane == ResponseLane.REQUEST_INFO:
-            return True
-        if self.response_lane == ResponseLane.ESCALATION_NOTICE:
+        if self.response_lane in {
+            ResponseLane.NO_REPLY,
+            ResponseLane.BOUNDARY_RESPONSE,
+            ResponseLane.REQUEST_INFO,
+            ResponseLane.ESCALATION_NOTICE,
+        }:
             return True
         return (
             self.response_lane == ResponseLane.TRACKING_UPDATE
@@ -169,18 +207,34 @@ class DraftResponse:
 
 
 @dataclass(slots=True)
+class ProcessingPolicy:
+    policy_version: str = "v1"
+    model_version: str = "heuristic"
+    duplicate_window: timedelta = timedelta(minutes=15)
+    max_messages_per_sender_per_hour: int = 12
+    max_links_before_quarantine: int = 3
+    max_attachment_bytes: int = 2_000_000
+
+
+@dataclass(slots=True)
 class AuditEvent:
-    old_state: str
-    new_state: str
+    message_id: str
+    thread_id: str
+    trace_id: str
+    old_state: WorkflowState
+    new_state: WorkflowState
     actor_type: str
     detail: str
+    policy_version: str
+    model_version: str
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass(slots=True)
 class OrchestrationResult:
     trace_id: str
-    final_state: str
+    policy_version: str
+    final_state: WorkflowState
     normalized_email: NormalizedEmail
     safety: SafetyAssessment
     routing: RoutingDecision

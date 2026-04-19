@@ -40,3 +40,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Local databases
+*.db

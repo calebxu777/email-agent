@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import sleep
+from typing import Protocol
 
 from .models import AuthorizationStatus, TrackingLookupRequest, TrackingLookupResult
+
+
+class TrackingBackend(Protocol):
+    def lookup_tracking(self, request: TrackingLookupRequest) -> TrackingLookupResult:
+        ...
+
+
+class BackendGatewayError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -40,10 +51,23 @@ class InMemoryTrackingBackend:
                 tracking_number_masked="1Z999AA********84",
                 estimated_delivery_window="Arriving in 2-3 business days",
                 last_scan_at="2026-04-19T14:30:00Z",
-            )
+            ),
+            "ZX99990000": DemoOrderRecord(
+                order_id="ZX99990000",
+                customer_email="other@example.com",
+                shipment_status="Delivered",
+                carrier="FedEx",
+                tracking_number_masked="612999********",
+                estimated_delivery_window="Delivered on April 18",
+                last_scan_at="2026-04-18T09:10:00Z",
+                data_freshness_seconds=7200,
+            ),
         }
 
     def lookup_tracking(self, request: TrackingLookupRequest) -> TrackingLookupResult:
+        if request.purpose != "customer_support_tracking":
+            raise BackendGatewayError("Unsupported lookup purpose.")
+
         record = self.orders.get(request.order_id)
         if not record:
             return TrackingLookupResult(
@@ -70,3 +94,22 @@ class InMemoryTrackingBackend:
             safe_to_disclose_fields=record.safe_to_disclose_fields,
             backend_trace_id=f"authorized:{request.order_id}",
         )
+
+
+@dataclass(slots=True)
+class ResilientTrackingGateway:
+    backend: TrackingBackend
+    max_attempts: int = 3
+    retry_delay_seconds: float = 0.05
+
+    def lookup_tracking(self, request: TrackingLookupRequest) -> TrackingLookupResult:
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return self.backend.lookup_tracking(request)
+            except Exception as exc:  # pragma: no cover - defensive wrapper
+                last_error = exc
+                if attempt == self.max_attempts:
+                    break
+                sleep(self.retry_delay_seconds * attempt)
+        raise BackendGatewayError(f"Tracking lookup failed after retries: {last_error}") from last_error

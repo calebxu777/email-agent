@@ -10,13 +10,16 @@ from .models import (
     AuditEvent,
     DraftResponse,
     Intent,
+    NormalizedEmail,
     OrchestrationResult,
+    ProcessingPolicy,
     RawEmail,
     ResponseLane,
     RoutingDecision,
     TrackingLookupRequest,
     TrackingLookupResult,
     TrackingWorksheet,
+    WorkflowState,
 )
 from .policies import (
     apply_backend_result,
@@ -40,47 +43,73 @@ class EmailOrchestrator:
         self._brain = brain or HeuristicSupportBrain()
         self._backend = backend
 
-    def process(self, raw_email: RawEmail) -> OrchestrationResult:
-        trace_id = str(uuid4())
+    def process(
+        self,
+        raw_email: RawEmail,
+        *,
+        trace_id: str | None = None,
+        policy: ProcessingPolicy | None = None,
+    ) -> OrchestrationResult:
+        trace_id = trace_id or str(uuid4())
+        policy = policy or ProcessingPolicy()
         events: list[AuditEvent] = []
 
-        normalized = normalize_email(raw_email)
-        events.append(AuditEvent("RECEIVED", "NORMALIZED", "system", "Email normalized and de-noised."))
-
-        safety = assess_safety(normalized)
-        events.append(
-            AuditEvent(
-                "NORMALIZED",
-                "SAFETY_CLASSIFIED",
-                "system",
-                "; ".join(safety.reasons),
-            )
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.RECEIVED,
+            WorkflowState.QUARANTINED,
+            policy,
+            "system",
+            "Raw email accepted into quarantine boundary.",
         )
 
-        if safety.disposition.name == "DROP_NO_REPLY":
-            routing = RoutingDecision(intent=Intent.SPAM, confidence=1.0, reasoning="Suppressed by safety policy.")
-            worksheet = TrackingWorksheet(
-                intent=Intent.SPAM,
-                sender_email=normalized.sender_email,
-                message_id=normalized.message_id,
-                thread_id=normalized.thread_id,
-                response_lane=ResponseLane.NO_REPLY,
-            )
-            result = OrchestrationResult(
+        normalized = normalize_email(raw_email)
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.QUARANTINED,
+            WorkflowState.NORMALIZED,
+            policy,
+            "system",
+            "Email normalized and de-noised.",
+        )
+
+        safety = assess_safety(normalized)
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.NORMALIZED,
+            WorkflowState.SAFETY_CLASSIFIED,
+            policy,
+            "system",
+            "; ".join(safety.reasons),
+        )
+
+        if safety.disposition == safety.disposition.DROP_NO_REPLY:
+            return self._suppressed_result(
+                normalized=normalized,
                 trace_id=trace_id,
-                final_state="SPAM_SUPPRESSED",
-                normalized_email=normalized,
+                policy=policy,
                 safety=safety,
-                routing=routing,
-                worksheet=worksheet,
-                backend_result=None,
-                draft_response=None,
-                audit_events=events,
+                events=events,
+                detail="Suppressed by safety policy.",
             )
-            return result
 
         routing = self._brain.route(normalized, safety)
-        events.append(AuditEvent("SAFETY_CLASSIFIED", "ROUTED", "model", routing.reasoning))
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.SAFETY_CLASSIFIED,
+            WorkflowState.ROUTED,
+            policy,
+            "model",
+            routing.reasoning,
+        )
 
         worksheet = TrackingWorksheet(
             intent=routing.intent,
@@ -88,16 +117,29 @@ class EmailOrchestrator:
             message_id=normalized.message_id,
             thread_id=normalized.thread_id,
         )
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.ROUTED,
+            WorkflowState.WORKSHEET_PENDING,
+            policy,
+            "system",
+            "Worksheet instantiated for safe slot filling.",
+        )
+
         worksheet.customer_request_summary = self._brain.summarize(normalized)
         populate_tracking_fields(worksheet, normalized)
         certify_tracking_text(worksheet, normalized)
-        events.append(
-            AuditEvent(
-                "ROUTED",
-                "TEXT_VERIFIED",
-                "system",
-                f"Text certified={worksheet.text_certified}; order_id={worksheet.order_id.value!r}",
-            )
+        self._append_event(
+            events,
+            raw_email,
+            trace_id,
+            WorkflowState.WORKSHEET_PENDING,
+            WorkflowState.TEXT_VERIFIED,
+            policy,
+            "system",
+            f"Text certified={worksheet.text_certified}; order_id={worksheet.order_id.value!r}",
         )
 
         backend_result: TrackingLookupResult | None = None
@@ -112,47 +154,54 @@ class EmailOrchestrator:
                 )
             )
             apply_backend_result(worksheet, backend_result)
-            events.append(
-                AuditEvent(
-                    "TEXT_VERIFIED",
-                    "BACKEND_VERIFIED",
-                    "backend",
-                    f"Authorization={backend_result.authorization_status.value}",
-                )
+            self._append_event(
+                events,
+                raw_email,
+                trace_id,
+                WorkflowState.TEXT_VERIFIED,
+                WorkflowState.BACKEND_VERIFIED,
+                policy,
+                "backend",
+                f"Authorization={backend_result.authorization_status.value}; freshness={backend_result.data_freshness_seconds}",
             )
 
         worksheet.response_lane = choose_response_lane(worksheet, safety, backend_result)
-        draft = self._compose_response(normalized.subject, worksheet, backend_result)
+        draft = self._compose_response(normalized, worksheet, backend_result)
 
         if draft:
             issues = audit_response(worksheet, draft.body, backend_result)
             if issues:
-                events.append(
-                    AuditEvent(
-                        "BACKEND_VERIFIED" if backend_result else "TEXT_VERIFIED",
-                        "BLOCKED_UNSAFE",
-                        "system",
-                        "; ".join(issues),
-                    )
+                self._append_event(
+                    events,
+                    raw_email,
+                    trace_id,
+                    WorkflowState.BACKEND_VERIFIED if backend_result else WorkflowState.TEXT_VERIFIED,
+                    WorkflowState.BLOCKED_UNSAFE,
+                    policy,
+                    "system",
+                    "; ".join(issues),
                 )
                 worksheet.response_lane = ResponseLane.ESCALATION_NOTICE
-                draft = self._compose_response(normalized.subject, worksheet, None)
-                final_state = "ESCALATED_TO_HUMAN"
+                draft = self._compose_response(normalized, worksheet, None)
+                final_state = WorkflowState.ESCALATED_TO_HUMAN
             else:
-                events.append(
-                    AuditEvent(
-                        "BACKEND_VERIFIED" if backend_result else "TEXT_VERIFIED",
-                        "RESPONSE_APPROVED",
-                        "system",
-                        f"Response approved in lane {worksheet.response_lane.value}.",
-                    )
+                final_state = self._state_from_lane(worksheet.response_lane)
+                self._append_event(
+                    events,
+                    raw_email,
+                    trace_id,
+                    WorkflowState.BACKEND_VERIFIED if backend_result else WorkflowState.TEXT_VERIFIED,
+                    WorkflowState.RESPONSE_APPROVED if final_state == WorkflowState.RESPONSE_APPROVED else final_state,
+                    policy,
+                    "system",
+                    f"Response approved in lane {worksheet.response_lane.value}.",
                 )
-                final_state = "RESPONSE_APPROVED"
         else:
-            final_state = "ESCALATED_TO_HUMAN"
+            final_state = WorkflowState.ESCALATED_TO_HUMAN
 
         return OrchestrationResult(
             trace_id=trace_id,
+            policy_version=policy.policy_version,
             final_state=final_state,
             normalized_email=normalized,
             safety=safety,
@@ -163,13 +212,61 @@ class EmailOrchestrator:
             audit_events=events,
         )
 
+    def _suppressed_result(
+        self,
+        *,
+        normalized: NormalizedEmail,
+        trace_id: str,
+        policy: ProcessingPolicy,
+        safety,
+        events: list[AuditEvent],
+        detail: str,
+    ) -> OrchestrationResult:
+        routing = RoutingDecision(intent=Intent.SPAM, confidence=1.0, reasoning=detail)
+        worksheet = TrackingWorksheet(
+            intent=Intent.SPAM,
+            sender_email=normalized.sender_email,
+            message_id=normalized.message_id,
+            thread_id=normalized.thread_id,
+            response_lane=ResponseLane.NO_REPLY,
+        )
+        self._append_event(
+            events,
+            RawEmail(
+                sender_email=normalized.sender_email,
+                subject=normalized.subject,
+                body_text=normalized.body_text,
+                message_id=normalized.message_id,
+                thread_id=normalized.thread_id,
+                received_at=normalized.received_at,
+            ),
+            trace_id,
+            WorkflowState.SAFETY_CLASSIFIED,
+            WorkflowState.SPAM_SUPPRESSED,
+            policy,
+            "system",
+            detail,
+        )
+        return OrchestrationResult(
+            trace_id=trace_id,
+            policy_version=policy.policy_version,
+            final_state=WorkflowState.SPAM_SUPPRESSED,
+            normalized_email=normalized,
+            safety=safety,
+            routing=routing,
+            worksheet=worksheet,
+            backend_result=None,
+            draft_response=None,
+            audit_events=events,
+        )
+
     def _compose_response(
         self,
-        original_subject: str,
+        normalized: NormalizedEmail,
         worksheet: TrackingWorksheet,
         backend_result: TrackingLookupResult | None,
     ) -> DraftResponse | None:
-        subject = self._reply_subject(original_subject)
+        subject = self._reply_subject(normalized.subject)
 
         if worksheet.response_lane == ResponseLane.NO_REPLY:
             return None
@@ -223,7 +320,7 @@ class EmailOrchestrator:
             )
             body = (
                 "Hello,\n\n"
-                f"Here is the latest update we can confirm for your order:\n"
+                "Here is the latest update we can confirm for your order:\n"
                 f"Status: {status_line}\n"
                 f"{carrier_line}"
                 f"{tracking_line}"
@@ -249,10 +346,43 @@ class EmailOrchestrator:
         return None
 
     @staticmethod
+    def _state_from_lane(lane: ResponseLane) -> WorkflowState:
+        if lane == ResponseLane.REQUEST_INFO:
+            return WorkflowState.AWAITING_CUSTOMER_INFO
+        if lane == ResponseLane.ESCALATION_NOTICE:
+            return WorkflowState.ESCALATED_TO_HUMAN
+        return WorkflowState.RESPONSE_APPROVED
+
+    @staticmethod
     def _reply_subject(original_subject: str) -> str:
         if original_subject.lower().startswith("re:"):
             return original_subject
         return f"Re: {original_subject}"
+
+    @staticmethod
+    def _append_event(
+        events: list[AuditEvent],
+        raw_email: RawEmail,
+        trace_id: str,
+        old_state: WorkflowState,
+        new_state: WorkflowState,
+        policy: ProcessingPolicy,
+        actor_type: str,
+        detail: str,
+    ) -> None:
+        events.append(
+            AuditEvent(
+                message_id=raw_email.message_id,
+                thread_id=raw_email.thread_id,
+                trace_id=trace_id,
+                old_state=old_state,
+                new_state=new_state,
+                actor_type=actor_type,
+                detail=detail,
+                policy_version=policy.policy_version,
+                model_version=policy.model_version,
+            )
+        )
 
     @staticmethod
     def as_dict(result: OrchestrationResult) -> dict:

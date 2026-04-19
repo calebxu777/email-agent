@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import re
+from datetime import datetime, timezone
 from typing import Iterable
 
 from .models import (
@@ -22,18 +24,37 @@ ORDER_ID_CANDIDATE_RE = re.compile(r"\b[A-Z0-9]{8,12}\b")
 TRACKING_RE = re.compile(r"\b(?:1Z[0-9A-Z]{16}|[0-9]{10,22})\b")
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 ABUSIVE_TERMS = {"idiot", "stupid", "damn", "useless", "hate"}
-PHISHING_TERMS = {"wire transfer", "gift card", "verify password", "login here", "crypto"}
-AUTO_HEADERS = {"auto-submitted", "precedence", "x-autoreply"}
-ORDER_ID_STOPWORDS = {"TRACKING", "SHIPMENT", "DELIVERY", "ORDERSTATUS"}
+PHISHING_TERMS = {
+    "wire transfer",
+    "gift card",
+    "verify password",
+    "login here",
+    "crypto",
+    "seed phrase",
+}
+PROMPT_INJECTION_TERMS = {
+    "ignore previous instructions",
+    "system prompt",
+    "developer message",
+    "reveal internal policy",
+    "bypass safety",
+}
+AUTO_HEADERS = {"auto-submitted", "precedence", "x-autoreply", "list-unsubscribe"}
+ORDER_ID_STOPWORDS = {"TRACKING", "SHIPMENT", "DELIVERY", "ORDERSTATUS", "SUPPORT"}
+HIDDEN_HTML_RE = re.compile(r"<(script|style|iframe|form)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
 
 
 def normalize_email(raw_email: RawEmail) -> NormalizedEmail:
-    source_text = raw_email.body_text or strip_html(raw_email.html_body or "")
+    sanitized_html = sanitize_html(raw_email.html_body or "")
+    source_text = raw_email.body_text or sanitized_html
     source_text = html.unescape(source_text)
     source_text = source_text.replace("\r\n", "\n")
     source_text = re.sub(r"[ \t]+", " ", source_text)
     source_text = re.sub(r"\n{3,}", "\n\n", source_text).strip()
     latest_message = remove_quoted_history(source_text)
+    body_hash = hashlib.sha256(latest_message.encode("utf-8")).hexdigest()
     return NormalizedEmail(
         sender_email=raw_email.sender_email.strip().lower(),
         subject=raw_email.subject.strip(),
@@ -41,13 +62,24 @@ def normalize_email(raw_email: RawEmail) -> NormalizedEmail:
         body_text=source_text,
         message_id=raw_email.message_id,
         thread_id=raw_email.thread_id,
-        received_at=raw_email.received_at,
+        received_at=raw_email.received_at.astimezone(timezone.utc),
         headers={key.lower(): value for key, value in raw_email.headers.items()},
+        body_hash=body_hash,
+        attachment_names=tuple(attachment.filename for attachment in raw_email.attachments),
     )
 
 
-def strip_html(html_body: str) -> str:
-    return re.sub(r"<[^>]+>", " ", html_body)
+def sanitize_html(html_body: str) -> str:
+    without_comments = COMMENT_RE.sub(" ", html_body)
+    without_active = HIDDEN_HTML_RE.sub(" ", without_comments)
+    without_remote_images = re.sub(r"<img[^>]+src=['\"]https?://[^>]+>", " ", without_active, flags=re.IGNORECASE)
+    without_hidden_style = re.sub(
+        r"<[^>]+style=['\"][^'\"]*(display\s*:\s*none|visibility\s*:\s*hidden)[^'\"]*['\"][^>]*>",
+        " ",
+        without_remote_images,
+        flags=re.IGNORECASE,
+    )
+    return TAG_RE.sub(" ", without_hidden_style)
 
 
 def remove_quoted_history(body_text: str) -> str:
@@ -55,6 +87,7 @@ def remove_quoted_history(body_text: str) -> str:
         "\nOn ",
         "\nFrom:",
         "\n-----Original Message-----",
+        "\nSent from my iPhone",
     )
     latest = body_text
     for marker in split_markers:
@@ -67,41 +100,59 @@ def remove_quoted_history(body_text: str) -> str:
 def assess_safety(email: NormalizedEmail) -> SafetyAssessment:
     labels: set[Intent] = set()
     reasons: list[str] = []
+    score = 0.0
     text = f"{email.subject}\n{email.latest_message_text}".lower()
-
-    if any(header in email.headers for header in AUTO_HEADERS):
-        reasons.append("Detected auto-generated headers.")
-        return SafetyAssessment(
-            disposition=SafetyDisposition.DROP_NO_REPLY,
-            labels={Intent.SPAM},
-            reasons=reasons,
-        )
-
     url_count = len(URL_RE.findall(text))
-    if url_count >= 3 or any(term in text for term in PHISHING_TERMS):
+    has_bulk_headers = any(header in email.headers for header in AUTO_HEADERS)
+    has_unsubscribe_marker = "unsubscribe" in text or "list-unsubscribe" in email.headers
+
+    if has_bulk_headers:
+        labels.add(Intent.SPAM)
+        reasons.append("Detected auto-generated or mailing-list headers.")
+        score += 0.8
+
+    if url_count >= 3:
         labels.add(Intent.PHISHING)
-        reasons.append("High-risk phishing or suspicious-link indicators detected.")
+        reasons.append("Email contains a suspicious number of links.")
+        score += 0.6
+
+    if any(term in text for term in PHISHING_TERMS):
+        labels.add(Intent.PHISHING)
+        reasons.append("Phishing-oriented language detected.")
+        score += 0.7
 
     if "unsubscribe" in text and url_count > 0:
         labels.add(Intent.SPAM)
         reasons.append("Marketing or bulk-email markers detected.")
+        score += 0.4
+
+    if any(term in text for term in PROMPT_INJECTION_TERMS):
+        labels.add(Intent.PHISHING)
+        reasons.append("Prompt-injection language detected in inbound content.")
+        score += 0.8
 
     if any(term in text for term in ABUSIVE_TERMS):
         labels.add(Intent.ABUSIVE)
         reasons.append("Abusive language detected.")
+        score += 0.3
 
-    if Intent.PHISHING in labels:
+    if email.attachment_names:
+        reasons.append(f"Email includes attachments: {', '.join(email.attachment_names)}.")
+
+    if Intent.PHISHING in labels and not (has_bulk_headers or has_unsubscribe_marker):
         return SafetyAssessment(
             disposition=SafetyDisposition.QUARANTINE_MANUAL,
             labels=labels,
             reasons=reasons,
+            risk_score=min(score, 1.0),
         )
 
-    if Intent.SPAM in labels and url_count >= 3:
+    if Intent.SPAM in labels and (has_bulk_headers or has_unsubscribe_marker or url_count >= 1):
         return SafetyAssessment(
             disposition=SafetyDisposition.DROP_NO_REPLY,
             labels=labels,
             reasons=reasons,
+            risk_score=min(score, 1.0),
         )
 
     if Intent.ABUSIVE in labels:
@@ -109,12 +160,14 @@ def assess_safety(email: NormalizedEmail) -> SafetyAssessment:
             disposition=SafetyDisposition.SAFE_TEMPLATE_ONLY,
             labels=labels,
             reasons=reasons,
+            risk_score=min(score, 1.0),
         )
 
     return SafetyAssessment(
         disposition=SafetyDisposition.ALLOW_ROUTE,
         labels=labels,
         reasons=reasons or ["No blocking safety signals detected."],
+        risk_score=min(score, 1.0),
     )
 
 
@@ -147,6 +200,8 @@ def populate_tracking_fields(worksheet: TrackingWorksheet, email: NormalizedEmai
         worksheet.order_id.source_excerpt = order_id
         worksheet.order_id.confidence = 0.95
         worksheet.order_id.validator_status = ValidatorStatus.VALID
+        worksheet.order_id.disclosure_level = "restricted"
+        worksheet.order_id.last_verified_at = datetime.now(timezone.utc)
     else:
         worksheet.order_id.validator_status = ValidatorStatus.INVALID
 
@@ -157,6 +212,8 @@ def populate_tracking_fields(worksheet: TrackingWorksheet, email: NormalizedEmai
         worksheet.tracking_number.source_excerpt = tracking_number
         worksheet.tracking_number.confidence = 0.85
         worksheet.tracking_number.validator_status = ValidatorStatus.VALID
+        worksheet.tracking_number.disclosure_level = "restricted"
+        worksheet.tracking_number.last_verified_at = datetime.now(timezone.utc)
 
     worksheet.customer_request_summary = summarize_request(email.latest_message_text)
 
@@ -165,13 +222,14 @@ def certify_tracking_text(worksheet: TrackingWorksheet, email: NormalizedEmail) 
     if worksheet.order_id.value and worksheet.order_id.value in email.latest_message_text.upper():
         worksheet.text_certified = True
         worksheet.order_id.validator_status = ValidatorStatus.VALID
+        worksheet.order_id.last_verified_at = datetime.now(timezone.utc)
     else:
         worksheet.text_certified = False
         worksheet.order_id.validator_status = ValidatorStatus.INVALID
 
 
 def apply_backend_result(worksheet: TrackingWorksheet, backend_result: TrackingLookupResult) -> None:
-    if backend_result.authorization_status == AuthorizationStatus.AUTHORIZED:
+    if backend_result.authorization_status == AuthorizationStatus.AUTHORIZED and backend_result.is_fresh:
         worksheet.identity_status = IdentityStatus.AUTHORIZED
         worksheet.backend_certified = True
     elif backend_result.authorization_status == AuthorizationStatus.UNAUTHORIZED:
@@ -199,7 +257,7 @@ def choose_response_lane(
         return ResponseLane.REQUEST_INFO
     if backend_result is None:
         return ResponseLane.REQUEST_INFO
-    if backend_result.authorization_status == AuthorizationStatus.AUTHORIZED:
+    if backend_result.authorization_status == AuthorizationStatus.AUTHORIZED and backend_result.is_fresh:
         return ResponseLane.TRACKING_UPDATE
     if backend_result.authorization_status in {
         AuthorizationStatus.UNAUTHORIZED,
@@ -232,7 +290,15 @@ def audit_response(
 ) -> list[str]:
     issues: list[str] = []
     lowered = draft_body.lower()
-    banned_terms = {"refund", "chargeback", "gift card", "fraud score", "spam score"}
+    banned_terms = {
+        "refund",
+        "chargeback",
+        "gift card",
+        "fraud score",
+        "spam score",
+        "internal policy",
+        "system prompt",
+    }
     found_banned = sorted(term for term in banned_terms if term in lowered)
     if found_banned:
         issues.append(f"Draft contains banned terms: {', '.join(found_banned)}.")
@@ -248,7 +314,7 @@ def audit_response(
                 issues.append("Draft leaks order-specific backend information before authorization.")
                 break
 
-    if "internal" in lowered or "policy" in lowered:
-        issues.append("Draft exposes internal-only language.")
+    if "your order was found" in lowered and worksheet.identity_status != IdentityStatus.AUTHORIZED:
+        issues.append("Draft confirms order existence before sender authorization.")
 
     return issues
